@@ -1,0 +1,424 @@
+---
+title: "Прогнозирование Оттока"
+output:
+  flexdashboard::flex_dashboard: 
+    source_code: 
+    social: ["", ""]
+runtime: shiny_prerendered
+---
+
+<style>                     
+.navbar {
+  background-color:#0D50A3;
+}
+</style>                    
+
+
+```{r include=FALSE}
+library(h2o)
+h2o.init()
+```
+
+
+```{r setup}
+library(flexdashboard)
+library(billboarder)
+library(tidyverse)
+library(tidyquant)
+library(corrr)
+library(scales)
+library(lime)
+library(glue)
+library(rsample)
+library(recipes)
+library(yardstick)
+library(readr)
+library(ggplot2)
+library(forcats)
+library(h2o)
+
+
+
+gbm <- h2o.loadModel('/Users/arturpopov/churn/GBM_model_R_1635429437532_70')
+
+x_train_tbl <- read.csv('x_train_tbl.csv')
+x_test_tbl <- read.csv('x_test_tbl.csv')
+
+
+# customer scorecard inputs
+main_vars <- c('tenure', 'Contract', 'InternetService', 'MonthlyCharges', 
+               'OnlineBackup', 'OnlineSecurity', 'DeviceProtection', 
+               'TechSupport', 'StreamingMovies', 'PhoneService')
+commercial_vars <- c('InternetService', 'OnlineBackup', 'OnlineSecurity', 
+                     'DeviceProtection', 'TechSupport', 'StreamingMovies', 
+                     'PhoneService')
+financial_vars <- c('PaymentMethod')
+customer_feature_vars <- c(main_vars, commercial_vars, financial_vars) %>% unique
+
+# transform original datasset
+churn_data_raw <- read_csv("data/WA_Fn-UseC_-Telco-Customer-Churn.csv") %>% 
+  mutate(
+    tenure_range = case_when(
+      tenure < 12 ~ '< 1 Yr',
+      tenure < 24 ~ '1-2 Yrs',
+      tenure < 36 ~ '2-3 Yrs',
+      tenure >= 36 ~ 'Over 3 Yrs',
+      TRUE ~ 'NA'
+    ),
+    monthly_charge_range = case_when(
+      MonthlyCharges < 20 ~ '< 20 per Month',
+      MonthlyCharges < 50 ~ '20-50 per Month',
+      MonthlyCharges < 100 ~ '50-100 per Month',
+      MonthlyCharges >= 100 ~ 'Over 100 per Month',
+      TRUE ~ 'NA'
+    )
+  )
+
+
+
+
+churn_data_tbl <- 
+  churn_data_raw %>%
+  drop_na() %>%
+  select(Churn, everything())
+
+```
+
+
+Customer Scorecard {data-orientation=rows}
+=============================================================================
+
+Sidebar {.sidebar}
+-----------------------------------------------------------------------------
+
+#### ID
+
+```{r}
+selectInput('customer_id', NULL, unique(churn_data_tbl$customerID))
+```
+
+#### Риск оттока
+
+```{r}
+gaugeOutput("churn_risk", width = "220px", height = "130px")
+```
+
+```{r, context="server"}
+output$churn_risk <- renderGauge({
+  
+  req(input$customer_id)
+        
+  selected_customer_id <- input$customer_id
+  
+  customer_tbl <- 
+    churn_data_tbl %>% 
+    mutate(churn_prob = rnorm(nrow(.), mean = 0.5,sd = 0.2)) %>% 
+    filter(customerID == selected_customer_id)
+    
+  
+  gauge(
+    round(customer_tbl$churn_prob * 100, digits = 1), 
+    min = 0, 
+    max = 100,
+    gaugeSectors(
+      success = c(0,33),
+      warning = c(33, 66),
+      danger = c(67,100)
+    ),
+    symbol = "%"
+  )
+})
+```
+
+*Создано в*
+![](assets/bcs_logo.jpeg){width=24} [BCS](https://bcs.ru/)
+
+
+Strategies
+-----------------------------------------------------------------------------
+
+```{css}
+.value-box .value-output,
+.value-box .caption {
+  font-size: 24px;
+}
+```
+
+### Основная стратегия
+
+```{r}
+valueBoxOutput("main")
+```
+
+```{r, context="server"}
+
+output$main <- renderValueBox({
+  
+   req(input$customer_id)
+        
+  selected_customer_id <- input$customer_id
+  
+  customer_tbl <- churn_data_tbl %>% 
+      filter(customerID == selected_customer_id)
+  
+  if (customer_tbl$tenure <= 9) {
+      main_strategy <- 'Удерживаем'
+  } else if (customer_tbl$tenure > 9 | customer_tbl$Contract == 'Month-to-month') {
+      main_strategy <- 'Предложить новый продукт'
+  } else if (customer_tbl$tenure > 12 & customer_tbl$InternetService == 'No') {
+      main_strategy <- 'Предложить новый продукт'
+  } else if (customer_tbl$tenure > 18 & customer_tbl$MonthlyCharges > 50) {
+      main_strategy <- 'Предложить скидку'
+  } else if (customer_tbl$tenure > 12 & 
+             customer_tbl$Contract != 'Month-to-month' & 
+             ((customer_tbl$OnlineBackup == 'No' & 
+               customer_tbl$OnlineSecurity == 'No' & 
+               customer_tbl$DeviceProtection == 'No' & 
+               customer_tbl$TechSupport == 'No' & 
+               customer_tbl$StreamingMovies == 'No') 
+              | customer_tbl$PhoneService == 'No')) {
+      main_strategy <- 'Предложить дополнительные продукты'
+  } else {
+      main_strategy <- 'Удерживаем и развиваем'
+  }
+  valueBox("Основная Стратегия", caption = main_strategy, color = "info")
+})
+```
+
+### Маркетинговая Стратегия
+
+```{r}
+valueBoxOutput("commercial")
+```
+
+```{r, context="server"}
+output$commercial <- renderValueBox({
+  
+  req(input$customer_id)
+        
+  selected_customer_id <- input$customer_id
+  
+  customer_tbl <- churn_data_tbl %>% 
+      filter(customerID == selected_customer_id)
+  
+  if ((customer_tbl$InternetService == 'DSL' & 
+       customer_tbl$OnlineBackup == 'No' & 
+       customer_tbl$OnlineSecurity == 'No' & 
+       customer_tbl$DeviceProtection == 'No' & 
+       customer_tbl$TechSupport == 'No' & 
+       customer_tbl$StreamingMovies == 'No') 
+      | customer_tbl$PhoneService == 'No') {
+      commercial_strategy <- 'Предлагаем продукты'
+  } else if (customer_tbl$InternetService == 'Fiber optic') {
+      commercial_strategy <- 'Предлагаем скидки'
+  } else if (customer_tbl$InternetService == 'No') {
+      commercial_strategy <- 'Агрессивно продаем продукты'
+  } else {
+      commercial_strategy <- 'Разрабатываем'
+  }
+  
+  valueBox("Маркетинговая Стратегия", caption = commercial_strategy, color = "primary")
+})
+```
+
+### Продуктовая
+
+```{r}
+valueBoxOutput("financial")
+```
+
+```{r, context="server"}
+output$financial <- renderValueBox({
+  
+  req(input$customer_id)
+        
+  selected_customer_id <- input$customer_id
+  
+  customer_tbl <- churn_data_tbl %>% 
+      filter(customerID == selected_customer_id)
+  
+  if (customer_tbl$PaymentMethod %in% c('Mailed Check', 'Electronic Check')) {
+    financial_strategy <- 'Move to credit card or bank transfer'
+  } else {
+    financial_strategy <- 'Удерживаем'
+  }
+  
+  valueBox("Финансовая Стратегия", caption = financial_strategy, color = "warning")
+})
+```
+
+
+```{js}
+
+$(document).on("shiny:sessioninitialized", function() {
+  $("#section-strategies .value-box").hover( 
+    function(e) {
+      var id = $(this).find(".shiny-valuebox-output").attr('id');
+      Shiny.onInputChange("strategy_box_hover", id); 
+    },
+    function(e) {
+      Shiny.onInputChange("strategy_box_hover", 'none'); 
+    }
+  );
+});
+
+```
+
+
+
+Customer Analysis
+-----------------------------------------------------------------------------
+
+### Customer Details {data-width=33}
+
+```{css}
+table.dataTable thead {
+  display:none;
+}
+
+table.dataTable tr.selected td, 
+table.dataTable td.selected {
+  background-color: #c3dbf7 !important;
+  border-color: #c3dbf7 !important;
+}
+```
+
+
+
+```{r}
+DT::dataTableOutput('customer_info_tbl')
+```
+
+
+```{r, context="server"}
+
+output$customer_info_tbl <- DT::renderDataTable({
+        
+  req(input$customer_id)
+  
+  selected_customer_id <- churn_data_tbl$customerID[1]
+  selected_customer_id <- input$customer_id
+  
+  customer_info <- churn_data_tbl %>% 
+      filter(customerID == selected_customer_id) %>% 
+      mutate(tenure = paste0(tenure, ifelse(tenure == 1, ' Month', ' Months'))) %>% 
+      select(customer_feature_vars) %>% 
+      gather(metric, value)
+  
+  DT::datatable(
+    customer_info, 
+    rownames = NULL, 
+    options = list(
+        dom = 't', 
+        bSort = FALSE, 
+        paging = FALSE
+    )
+  )
+})
+
+observeEvent(input$strategy_box_hover, {
+    
+  strategy_hover <- input$strategy_box_hover
+        
+  if (strategy_hover == 'none') {
+    row_indices <- 0
+  } else {
+    strategy_features <- get(paste0(strategy_hover, '_vars'))
+    row_indices <- match(strategy_features, customer_feature_vars)
+  }
+  
+  DT::dataTableProxy('customer_info_tbl') %>% 
+    DT::selectRows(row_indices)
+})
+```
+
+
+### Contributions to Churn (LIME) {data-width=67}
+
+```{r}
+billboarderOutput('customer_explanation')
+```
+
+```{r, context="server"}
+
+output$customer_explanation <- renderBillboarder({
+     
+  req(input$customer_id)
+  
+  selected_customer_id <- input$customer_id
+  
+  #selected_customer_id <- "3413-BMNZE"
+  
+  #selected_customer_id <- "6713-OKOMC" 
+  
+  # Run lime() on training set
+  
+  
+  
+  explainer <- lime::lime(
+    x = x_train_tbl,
+    model = gbm,
+    bin_continuous = FALSE
+  )
+  
+  Sys.sleep(1)
+  
+  
+  customer_index <- 
+    churn_data_tbl %>% 
+    mutate(rownum = row_number()) %>% 
+    filter(customerID == selected_customer_id) %>%
+    select(rownum)
+  
+  
+  Sys.sleep(1)
+  
+  # Run explain() on explainer
+  
+  explanation <- explain(
+    x_test_tbl[customer_index$rownum,], 
+    explainer = explainer, 
+    n_labels = 1, 
+    n_features = length(x_test_tbl),
+    kernel_width = 0.5
+  )
+  
+  type_pal <- c('Supports', 'Contradicts')
+  explanation$type <- factor(ifelse(sign(explanation$feature_weight) == 
+                                        1, type_pal[1], type_pal[2]), levels = type_pal)
+  description <- paste0(explanation$case, "_", explanation$label)
+  desc_width <- max(nchar(description)) + 1
+  description <- paste0(format(description, width = desc_width), 
+                        explanation$feature_desc)
+  explanation$description <- factor(description, levels = description[order(abs(explanation$feature_weight))])
+  explanation$case <- factor(explanation$case, unique(explanation$case))
+  
+  explanation_plot_df <- explanation %>%
+    mutate(churn_predictor = case_when(
+        (label == 'p1' & type == 'Contradicts') | (label == 'p0' & type == 'Contradicts') ~ 'More likely to churn',
+        (label == 'p1' & type == 'Supports') | (label == 'p0' & type == 'Supports') ~ 'Less likely to churn'
+    )) %>%
+    arrange(-abs(feature_weight)) %>% 
+    head(10)
+  
+  
+  billboarder() %>%
+    bb_barchart(
+        data = explanation_plot_df %>% 
+          dplyr::select(feature_desc,feature_weight, churn_predictor),
+        mapping = bbaes(x = feature_desc, 
+                        y = feature_weight,
+                        group = churn_predictor),
+        rotated = TRUE,
+        stacked = TRUE
+    ) %>%
+    bb_colors_manual('Less likely to churn' = 'rgba(63, 182, 24, 0.7)', 'More likely to churn' = 'rgba(255, 0, 57, 0.7)')
+  
+  # %>%
+  #   bb_colors_manual('Less likely to churn' =   'rgba(255, 0, 57, 0.7)', 
+  #                    'More likely to churn' ='rgba(63, 182, 24, 0.7)')
+  
+})
+
+```
+
